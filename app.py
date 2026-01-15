@@ -1,32 +1,37 @@
 import threading
 import asyncio
 import telnetlib3
-import json
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-TELNET_HOST = "10.4.30.168"
-TELNET_PORT = 8885
-
+# ------------------ Globals ------------------
 log_buffer = []
 log_lock = threading.Lock()
 MAX_LOGS = 100000
 
+telnet_thread = None
+telnet_stop_event = threading.Event()
+telnet_writer = None
 
-async def telnet_reader_async():
+
+# ------------------ Telnet Reader ------------------
+async def telnet_reader_async(host, port):
+    global telnet_writer
     backoff = 5
-    while True:
-        try:
-            reader, writer = await telnetlib3.open_connection(
-                TELNET_HOST, TELNET_PORT
-            )
-            print("Telnet connected.")
 
-            while True:
+    while not telnet_stop_event.is_set():
+        try:
+            reader, writer = await telnetlib3.open_connection(host, port)
+            telnet_writer = writer
+
+            with log_lock:
+                log_buffer.append(f"[INFO] Connected to {host}:{port}")
+
+            while not telnet_stop_event.is_set():
                 line = await reader.readline()
                 if not line:
-                    raise ConnectionError("telnet connection closed")
+                    raise ConnectionError("connection closed")
 
                 with log_lock:
                     log_buffer.append(line.rstrip())
@@ -34,31 +39,71 @@ async def telnet_reader_async():
                         del log_buffer[:-MAX_LOGS]
 
         except Exception as e:
-            with log_lock:
-                log_buffer.append(f"[ERROR] {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            if not telnet_stop_event.is_set():
+                with log_lock:
+                    log_buffer.append(f"[ERROR] {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+    if telnet_writer:
+        telnet_writer.close()
+        telnet_writer = None
 
 
-def start_telnet_loop():
-    asyncio.run(telnet_reader_async())
+def start_telnet_loop(host, port):
+    asyncio.run(telnet_reader_async(host, port))
 
 
+# ------------------ API ------------------
 @app.route("/logs")
 def get_logs():
-    start = int(request.args.get("start", 0))
     with log_lock:
-        return jsonify({
-            "logs": log_buffer[start:],
-            "next": len(log_buffer)
-        })
+        return jsonify(log_buffer)
 
 
 @app.route("/clear_logs", methods=["POST"])
 def clear_logs():
     with log_lock:
         log_buffer.clear()
-    return "", 204
+    return jsonify({"status": "cleared"})
+
+
+@app.route("/connect", methods=["POST"])
+def connect():
+    global telnet_thread
+
+    if telnet_thread:
+        return jsonify({"error": "Already connected"}), 400
+
+    data = request.json
+    telnet_stop_event.clear()
+
+    telnet_thread = threading.Thread(
+        target=start_telnet_loop,
+        args=(data["host"], int(data["port"])),
+        daemon=True,
+    )
+    telnet_thread.start()
+
+    return jsonify({"status": "connected"})
+
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    global telnet_thread
+
+    telnet_stop_event.set()
+
+    if telnet_thread:
+        telnet_thread.join(timeout=3)
+        telnet_thread = None
+
+    telnet_stop_event.clear()
+
+    with log_lock:
+        log_buffer.append("[INFO] Disconnected")
+
+    return jsonify({"status": "disconnected"})
 
 
 @app.route("/")
@@ -66,48 +111,48 @@ def index():
     return render_template_string(HTML_PAGE)
 
 
+# ------------------ HTML ------------------
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Telnet Log Viewer</title>
-    <style>
-        body { font-family: monospace; background: #111; color: #eee; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #444; padding: 4px 8px; }
-        th { background: #222; position: sticky; top: 0; }
-        #log-container { height: 85vh; overflow-y: auto; }
-
-        .filter-row button {
-            margin-left: 6px;
-        }
-        .delete-btn {
-            color: #ff6666;
-            font-weight: bold;
-        }
-    </style>
+<title>Telnet Log Viewer</title>
+<style>
+body { font-family: monospace; background:#111; color:#eee; }
+table { width:100%; border-collapse:collapse; }
+th, td { border:1px solid #444; padding:4px 8px; }
+th { background:#222; position:sticky; top:0; }
+#log-container { height:80vh; overflow-y:auto; margin-top:10px; }
+input[type="text"] { width:500px; }
+.filter-row { margin-top:5px; }
+button { margin-left:5px; }
+</style>
 </head>
 <body>
 
-<h2>Telnet Logs</h2>
+<h3>
+IP:<input id="host" value="10.4.30.168">
+Port:<input id="port" value="8885" style="width:80px">
+<button id="connectBtn">Connect</button>
+</h3>
 
-<div>
+<!-- FILTERS -->
+<div id="filters-container">
+    <button onclick="addFilter()">+ Add Filter</button>
     <button onclick="saveFilters()">Save Filters</button>
     <button onclick="loadFilters()">Load Filters</button>
 </div>
 
-<div id="filters-container" style="margin:10px 0;">
-    <button onclick="addFilterRow()">+ Add Filter</button>
-</div>
-
-<div style="margin-bottom:10px;">
+<!-- CONTROLS -->
+<div style="margin-top:8px;">
     <button onclick="clearLogs()">Clear Logs</button>
     <label>
-        <input type="checkbox" id="showMatchesOnly">
+        <input type="checkbox" id="matchesOnly">
         Show matches only
     </label>
 </div>
 
+<!-- LOG TABLE -->
 <div id="log-container">
 <table>
 <thead><tr><th>Log Entry</th></tr></thead>
@@ -117,126 +162,140 @@ HTML_PAGE = """
 
 <script>
 let filters = [];
-let lastIndex = 0;
+let lastLength = 0;
+let connected = false;
 
-function addFilterRow(regex="", color="#ff0000", active=false) {
-    const container = document.getElementById("filters-container");
+// ------------------ Connection ------------------
+document.getElementById("connectBtn").onclick = async () => {
+    if (!connected) {
+        const res = await fetch("/connect", {
+            method:"POST",
+            headers:{ "Content-Type":"application/json" },
+            body: JSON.stringify({
+                host: document.getElementById("host").value,
+                port: document.getElementById("port").value
+            })
+        });
+        if (res.ok) {
+            connected = true;
+            document.getElementById("connectBtn").textContent = "Disconnect";
+        }
+    } else {
+        await fetch("/disconnect", { method:"POST" });
+        connected = false;
+        document.getElementById("connectBtn").textContent = "Connect";
+    }
+};
 
+// ------------------ Logs ------------------
+function clearLogs() {
+    fetch("/clear_logs", { method:"POST" });
+    document.getElementById("log-body").innerHTML = "";
+    lastLength = 0;
+}
+
+// ------------------ Filters ------------------
+function addFilter(regex="", color="#ff0000", active=false) {
     const row = document.createElement("div");
     row.className = "filter-row";
-    row.style.marginTop = "5px";
 
-    const deleteBtn = document.createElement("button");
-    deleteBtn.textContent = "✕";
-    deleteBtn.className = "delete-btn";
+    const del = document.createElement("button");
+    del.textContent = "X";
 
-    const regexInput = document.createElement("input");
-    regexInput.placeholder = "Regex";
-    regexInput.value = regex;
-    regexInput.style.width = "600px";
+    const input = document.createElement("input");
+    input.value = regex;
+    input.style.width = "600px";
 
     const colorInput = document.createElement("input");
     colorInput.type = "color";
     colorInput.value = color;
 
-    const toggleBtn = document.createElement("button");
-    toggleBtn.textContent = active ? "Deactivate" : "Activate";
+    const btn = document.createElement("button");
 
-    const filter = {
-        regexInput,
-        colorInput,
-        active,
-        regexObj: active && regex ? new RegExp(regex, "i") : null,
-        row
+    const f = { row, input, colorInput, regex:null, active:false };
+
+    function activate() {
+        try { f.regex = new RegExp(input.value, "i"); }
+        catch { alert("Invalid regex"); return; }
+        f.active = true;
+        btn.textContent = "Deactivate";
+    }
+
+    function deactivate() {
+        f.active = false;
+        btn.textContent = "Activate";
+    }
+
+    btn.onclick = () => {
+        f.active ? deactivate() : activate();
+        applyFilters();
     };
 
-    deleteBtn.onclick = () => {
-        filter.active = false;
-        filters = filters.filter(f => f !== filter);
+    del.onclick = () => {
+        filters = filters.filter(x => x !== f);
         row.remove();
         applyFilters();
     };
 
-    toggleBtn.onclick = () => {
-        if (!filter.active) {
-            try {
-                filter.regexObj = new RegExp(regexInput.value, "i");
-            } catch {
-                alert("Invalid regex");
-                return;
-            }
-            filter.active = true;
-            toggleBtn.textContent = "Deactivate";
-        } else {
-            filter.active = false;
-            filter.regexObj = null;
-            toggleBtn.textContent = "Activate";
-        }
-        applyFilters();
-    };
+    row.append(del, input, colorInput, btn);
+    document.getElementById("filters-container").appendChild(row);
+    filters.push(f);
 
-    row.append(deleteBtn, regexInput, colorInput, toggleBtn);
-    container.appendChild(row);
-    filters.push(filter);
+    if (active) activate();
+    else deactivate();
 }
 
 function applyFilters() {
-    const showOnly = document.getElementById("showMatchesOnly").checked;
-    document.querySelectorAll("#log-body tr").forEach(row => {
-        row.style.background = "";
-        row.style.display = "";
+    const rows = document.getElementById("log-body").children;
+    for (let r of rows) {
+        r.style.background = "";
         let matched = false;
 
-        // Newest filters take precedence
         for (let i = filters.length - 1; i >= 0; i--) {
             const f = filters[i];
-            if (f.active && f.regexObj && f.regexObj.test(row.textContent)) {
-                row.style.background = f.colorInput.value;
+            if (f.active && f.regex && f.regex.test(r.textContent)) {
+                r.style.background = f.colorInput.value;
                 matched = true;
                 break;
             }
         }
-        if (showOnly && !matched) row.style.display = "none";
-    });
+
+        r.style.display =
+            document.getElementById("matchesOnly").checked && !matched
+            ? "none" : "";
+    }
 }
 
+// ------------------ Fetch Logs ------------------
 async function fetchLogs() {
-    const res = await fetch(`/logs?start=${lastIndex}`);
-    const data = await res.json();
+    const res = await fetch("/logs");
+    const logs = await res.json();
 
     const tbody = document.getElementById("log-body");
-    const container = document.getElementById("log-container");
+    const cont = document.getElementById("log-container");
+    const atBottom = cont.scrollHeight - cont.scrollTop - cont.clientHeight < 5;
 
-    const atBottom =
-        container.scrollHeight - container.scrollTop - container.clientHeight < 5;
-
-    for (const line of data.logs) {
+    for (let i = lastLength; i < logs.length; i++) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.textContent = line;
+        td.textContent = logs[i];
         tr.appendChild(td);
         tbody.appendChild(tr);
     }
 
-    lastIndex = data.next;
+    lastLength = logs.length;
     applyFilters();
-
-    if (atBottom) container.scrollTop = container.scrollHeight;
+    if (atBottom) cont.scrollTop = cont.scrollHeight;
 }
 
-async function clearLogs() {
-    await fetch("/clear_logs", { method: "POST" });
-    document.getElementById("log-body").innerHTML = "";
-    lastIndex = 0;
-}
-
+// ------------------ Save / Load Filters ------------------
 function saveFilters() {
     const data = filters.map(f => ({
-        regex: f.regexInput.value,
+        regex: f.input.value,
         color: f.colorInput.value,
         active: f.active
     }));
-    const blob = new Blob([JSON.stringify(data, null, 2)]);
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:"application/json"});
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "filters.json";
@@ -244,32 +303,29 @@ function saveFilters() {
 }
 
 function loadFilters() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "application/json";
-    input.onchange = () => {
-        const reader = new FileReader();
-        reader.onload = () => {
-            document.getElementById("filters-container").innerHTML =
-                '<button onclick="addFilterRow()">+ Add Filter</button>';
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.onchange = () => {
+        const r = new FileReader();
+        r.onload = () => {
             filters = [];
-            JSON.parse(reader.result).forEach(f =>
-                addFilterRow(f.regex, f.color, f.active)
-            );
+            document.querySelectorAll(".filter-row").forEach(e => e.remove());
+            JSON.parse(r.result).forEach(f => {
+                addFilter(f.regex, f.color, f.active);
+            });
             applyFilters();
         };
-        reader.readAsText(input.files[0]);
+        r.readAsText(inp.files[0]);
     };
-    input.click();
+    inp.click();
 }
 
 setInterval(fetchLogs, 1000);
 </script>
-
 </body>
 </html>
 """
 
+# ------------------ Run ------------------
 if __name__ == "__main__":
-    threading.Thread(target=start_telnet_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=4999, debug=False)
