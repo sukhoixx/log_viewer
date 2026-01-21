@@ -8,12 +8,14 @@ app = Flask(__name__)
 # ------------------ Globals ------------------
 log_buffer = []
 log_lock = threading.Lock()
-MAX_LOGS = 100000
+MAX_LOGS = 1000000
 
 telnet_thread = None
 telnet_stop_event = threading.Event()
 telnet_writer = None
 
+connected_host = None
+connected_port = None
 
 # ------------------ Telnet Reader ------------------
 async def telnet_reader_async(host, port):
@@ -70,17 +72,20 @@ def clear_logs():
 
 @app.route("/connect", methods=["POST"])
 def connect():
-    global telnet_thread
+    global telnet_thread, connected_host, connected_port
 
-    if telnet_thread:
+    if telnet_thread and telnet_thread.is_alive():
         return jsonify({"error": "Already connected"}), 400
 
     data = request.json
     telnet_stop_event.clear()
 
+    connected_host = data["host"]
+    connected_port = int(data["port"])
+
     telnet_thread = threading.Thread(
         target=start_telnet_loop,
-        args=(data["host"], int(data["port"])),
+        args=(connected_host, connected_port),
         daemon=True,
     )
     telnet_thread.start()
@@ -90,7 +95,7 @@ def connect():
 
 @app.route("/disconnect", methods=["POST"])
 def disconnect():
-    global telnet_thread
+    global telnet_thread, connected_host, connected_port
 
     telnet_stop_event.set()
 
@@ -103,7 +108,20 @@ def disconnect():
     with log_lock:
         log_buffer.append("[INFO] Disconnected")
 
+    connected_host = None
+    connected_port = None
+
     return jsonify({"status": "disconnected"})
+
+
+@app.route("/status")
+def status():
+    alive = telnet_thread is not None and telnet_thread.is_alive()
+    return jsonify({
+        "connected": alive,
+        "host": connected_host,
+        "port": connected_port
+    })
 
 
 @app.route("/")
@@ -131,19 +149,17 @@ button { margin-left:5px; }
 <body>
 
 <h3>
-IP:<input id="host" value="10.4.30.168">
+IP:<input id="host" value="">
 Port:<input id="port" value="8885" style="width:80px">
 <button id="connectBtn">Connect</button>
 </h3>
 
-<!-- FILTERS -->
 <div id="filters-container">
     <button onclick="addFilter()">+ Add Filter</button>
     <button onclick="saveFilters()">Save Filters</button>
     <button onclick="loadFilters()">Load Filters</button>
 </div>
 
-<!-- CONTROLS -->
 <div style="margin-top:8px;">
     <button onclick="clearLogs()">Clear Logs</button>
     <label>
@@ -152,7 +168,6 @@ Port:<input id="port" value="8885" style="width:80px">
     </label>
 </div>
 
-<!-- LOG TABLE -->
 <div id="log-container">
 <table>
 <thead><tr><th>Log Entry</th></tr></thead>
@@ -164,6 +179,19 @@ Port:<input id="port" value="8885" style="width:80px">
 let filters = [];
 let lastLength = 0;
 let connected = false;
+
+// ------------------ Check status on load ------------------
+async function checkStatus() {
+    const res = await fetch("/status");
+    const s = await res.json();
+    connected = s.connected;
+    document.getElementById("connectBtn").textContent = connected ? "Disconnect" : "Connect";
+    if (connected) {
+        document.getElementById("host").value = s.host;
+        document.getElementById("port").value = s.port;
+    }
+}
+checkStatus();
 
 // ------------------ Connection ------------------
 document.getElementById("connectBtn").onclick = async () => {
@@ -326,6 +354,19 @@ setInterval(fetchLogs, 1000);
 </html>
 """
 
-# ------------------ Run ------------------
+import time
+import threading
+import webbrowser
+
+def run_flask():
+    app.run(host="127.0.0.1", port=4999, debug=False, use_reloader=False)
+
+def open_browser():
+    webbrowser.open("http://127.0.0.1:4999")
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=4999, debug=False)
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Timer(1.0, open_browser).start()
+
+    while True:
+        time.sleep(1)
